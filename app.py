@@ -311,38 +311,62 @@ def generate_report(dob_str, start_date):
 
 
 def render_simple_pdf(data, output_path):
-    """Simplified renderer for the automated pipeline — base-14 fonts only,
-    no TTF dependency, so it can't fail on a server without the brand fonts
-    installed. Full brand-matched rendering stays the tool for reports
-    Robert generates and reviews himself; this is the guaranteed-to-run
-    version for unattended delivery."""
+    """Uses the real Avatar Training brand fonts (Cormorant Garamond, Space
+    Mono, DM Sans), bundled directly in this repo's fonts/ folder as static
+    weight instances extracted from Google's variable font files — so
+    rendering doesn't depend on what happens to be installed on the server.
+    See fonts/README.md for how these were generated if they ever need
+    regenerating (e.g. a new weight)."""
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas
     from reportlab.lib.units import mm
     from reportlab.lib.colors import HexColor
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+    for name, filename in [
+        ("Cormorant", "CormorantGaramond-Regular.ttf"),
+        ("Cormorant-Bold", "CormorantGaramond-Bold.ttf"),
+        ("Cormorant-Italic", "CormorantGaramond-Italic.ttf"),
+        ("DMSans", "DMSans-Regular.ttf"),
+        ("DMSans-Bold", "DMSans-Bold.ttf"),
+        ("SpaceMono", "SpaceMono-Regular.ttf"),
+        ("SpaceMono-Bold", "SpaceMono-Bold.ttf"),
+    ]:
+        try:
+            pdfmetrics.registerFont(TTFont(name, os.path.join(FONT_DIR, filename)))
+        except Exception:
+            pass  # falls through to base-14 names below if a font is missing
+
+    def f(brand_name, fallback):
+        """Use the brand font if it registered successfully, otherwise the
+        reportlab base-14 fallback — keeps this from crashing in production
+        even if a font file is ever missing."""
+        return brand_name if brand_name in pdfmetrics.getRegisteredFontNames() else fallback
 
     NAVY, GOLD, CREAM = HexColor("#0A0A08"), HexColor("#C9A84C"), HexColor("#F5F2E8")
     c = canvas.Canvas(output_path, pagesize=A4)
     W, H = A4
 
     c.setFillColor(NAVY); c.rect(0, 0, W, H, fill=1, stroke=0)
-    c.setFillColor(GOLD); c.setFont("Helvetica", 10)
+    c.setFillColor(GOLD); c.setFont(f("SpaceMono", "Helvetica"), 10)
     c.drawCentredString(W/2, H-60*mm, "AVATAR TRAINING")
-    c.setFillColor(CREAM); c.setFont("Times-Bold", 32)
+    c.setFillColor(CREAM); c.setFont(f("Cormorant-Bold", "Times-Bold"), 32)
     c.drawCentredString(W/2, H-80*mm, "Performance Timing")
-    c.setFillColor(GOLD); c.setFont("Times-Italic", 13)
+    c.setFillColor(GOLD); c.setFont(f("Cormorant-Italic", "Times-Italic"), 13)
     c.drawCentredString(W/2, H-90*mm, f"{data['period']['start_date']} to {data['period']['end_date']}")
     c.showPage()
 
     c.setFillColor(CREAM); c.rect(0, 0, W, H, fill=1, stroke=0)
     y = H - 25*mm
-    c.setFillColor(NAVY); c.setFont("Times-Bold", 18)
+    c.setFillColor(NAVY); c.setFont(f("Cormorant-Bold", "Times-Bold"), 18)
     c.drawString(18*mm, y, "Peak Decision Day"); y -= 10*mm
-    c.setFont("Times-Roman", 13)
+    c.setFont(f("DMSans", "Times-Roman"), 13)
     c.drawString(18*mm, y, data["peak_decision_day"]); y -= 16*mm
-    c.setFont("Times-Bold", 14)
+    c.setFont(f("Cormorant-Bold", "Times-Bold"), 14)
     c.drawString(18*mm, y, "Rest & Recovery Days"); y -= 8*mm
-    c.setFont("Times-Roman", 10)
+    c.setFont(f("DMSans", "Times-Roman"), 10)
     for sd in data["standdown_days"]:
         c.drawString(18*mm, y, f"- {sd}"); y -= 6*mm
         if y < 20*mm:
@@ -351,13 +375,13 @@ def render_simple_pdf(data, output_path):
 
     c.setFillColor(CREAM); c.rect(0, 0, W, H, fill=1, stroke=0)
     y = H - 25*mm
-    c.setFillColor(NAVY); c.setFont("Times-Bold", 16)
+    c.setFillColor(NAVY); c.setFont(f("Cormorant-Bold", "Times-Bold"), 16)
     c.drawString(18*mm, y, "Daily Timing"); y -= 12*mm
-    c.setFont("Helvetica-Bold", 8)
+    c.setFont(f("SpaceMono", "Helvetica-Bold"), 8)
     for day in data["daily"]:
         if y < 20*mm:
             c.showPage(); c.setFillColor(CREAM); c.rect(0,0,W,H,fill=1,stroke=0); y = H-25*mm
-            c.setFillColor(NAVY); c.setFont("Helvetica-Bold", 8)
+            c.setFillColor(NAVY); c.setFont(f("SpaceMono", "Helvetica-Bold"), 8)
         line = f"{day['date']} ({day['weekday'][:3]}): " + " | ".join(
             f"{k[:4]}:{v['verdict'][:3]}" for k, v in day["categories"].items()
         )
