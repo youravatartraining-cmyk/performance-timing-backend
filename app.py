@@ -128,21 +128,67 @@ def notify_failure(reason, detail):
         pass  # this IS the failure path — nowhere further to escalate to
 
 
-def send_report_email(to_email, subscriber_name, pdf_path, ics_path, period_label):
+def send_report_email(to_email, subscriber_name, pdf_path, ics_path, period_label, peak_date, standdown_count):
     address = os.environ.get("GMAIL_ADDRESS")
     app_password = os.environ.get("GMAIL_APP_PASSWORD")
+    first_name = (subscriber_name or "").split(" ")[0] or "there"
+
+    peak_dt = datetime.strptime(peak_date, "%Y-%m-%d")
+    peak_display = peak_dt.strftime("%A, %d %B")
 
     msg = EmailMessage()
     msg["Subject"] = f"Your Performance Timing Calendar — {period_label}"
     msg["From"] = address
     msg["To"] = to_email
-    msg.set_content(
-        f"Hi {subscriber_name or 'there'},\n\n"
-        f"Your Performance Timing calendar for {period_label} is attached — "
-        f"a PDF you can save or print, and a calendar file that syncs "
-        f"straight into your phone.\n\n"
-        f"Avatar Training\nL.I.T.A."
+
+    # Plain-text fallback (some clients block HTML, or the person reads on
+    # something that strips it) — real content, not just "see attached."
+    plain = (
+        f"Hi {first_name},\n\n"
+        f"Your Performance Timing calendar for {period_label} is ready.\n\n"
+        f"Two files are attached:\n"
+        f"- A PDF you can save, print, or screenshot — includes your full "
+        f"day-by-day breakdown across all five categories.\n"
+        f"- A calendar file (.ics) — open it on your phone or computer and "
+        f"it adds every day's reading straight into your calendar app.\n\n"
+        f"Your Peak Decision Day this cycle is {peak_display} — if you have "
+        f"a choice about timing something important, that's the day to use.\n\n"
+        f"You also have {standdown_count} Rest & Recovery days flagged this "
+        f"cycle, listed on the Month at a Glance page of the PDF.\n\n"
+        f"Questions? Just reply to this email.\n\n"
+        f"Avatar Training\nL.I.T.A. — Love Is The Answer"
     )
+    msg.set_content(plain)
+
+    html = f"""\
+<html><body style="margin:0;padding:0;background-color:#0A0A08;font-family:Georgia,'Times New Roman',serif;">
+<div style="max-width:520px;margin:0 auto;padding:40px 24px;">
+  <p style="font-family:Courier,monospace;font-size:11px;letter-spacing:3px;color:#C9A84C;text-align:center;margin:0 0 24px;">AVATAR TRAINING</p>
+  <h1 style="font-size:28px;font-weight:normal;color:#F5F2E8;text-align:center;margin:0 0 8px;">Performance Timing</h1>
+  <p style="font-style:italic;font-size:14px;color:#C9A84C;text-align:center;margin:0 0 32px;">{period_label}</p>
+
+  <p style="font-size:15px;color:#D8D4C4;line-height:1.7;">Hi {first_name},</p>
+  <p style="font-size:15px;color:#D8D4C4;line-height:1.7;">Your calendar for this cycle is ready — two files are attached.</p>
+
+  <div style="background-color:#161614;border:1px solid #2A2A26;padding:20px 22px;margin:24px 0;">
+    <p style="font-family:Courier,monospace;font-size:10px;letter-spacing:2px;color:#8A6E30;margin:0 0 6px;">PEAK DECISION DAY</p>
+    <p style="font-size:19px;color:#F5F2E8;margin:0 0 8px;">{peak_display}</p>
+    <p style="font-size:13.5px;color:#9A9A8E;line-height:1.6;margin:0;">If you have a choice about timing something important this cycle, this is the day to use it.</p>
+  </div>
+
+  <p style="font-size:15px;color:#D8D4C4;line-height:1.7;"><strong style="color:#F5F2E8;">The PDF</strong> — save, print, or screenshot it. Includes your full day-by-day breakdown across all five categories, plus a Month at a Glance page listing your {standdown_count} Rest &amp; Recovery days for this cycle.</p>
+  <p style="font-size:15px;color:#D8D4C4;line-height:1.7;"><strong style="color:#F5F2E8;">The calendar file (.ics)</strong> — open it on your phone or computer and every day's reading gets added straight into your calendar app.</p>
+
+  <p style="font-size:14px;color:#9A9A8E;line-height:1.7;margin-top:32px;">Questions? Just reply to this email.</p>
+
+  <div style="border-top:1px solid #2A2A26;margin-top:32px;padding-top:20px;text-align:center;">
+    <p style="font-family:'Times New Roman',serif;font-style:italic;font-size:14px;color:#8A6E30;margin:0 0 4px;">L.I.T.A.</p>
+    <p style="font-family:Courier,monospace;font-size:9px;letter-spacing:1px;color:#9A9A8E;margin:0;">LOVE IS THE ANSWER</p>
+  </div>
+</div>
+</body></html>"""
+    msg.add_alternative(html, subtype="html")
+
     with open(pdf_path, "rb") as f:
         msg.add_attachment(f.read(), maintype="application", subtype="pdf",
                             filename=os.path.basename(pdf_path))
@@ -202,7 +248,10 @@ def stripe_webhook():
         result = generate_report(dob, start_date)
         period_label = f"{result['period']['start_date']} to {result['period']['end_date']}"
         subscriber_name = session.get("customer_details", {}).get("name", "")
-        send_report_email(customer_email, subscriber_name, result["pdf_path"], result["ics_path"], period_label)
+        send_report_email(
+            customer_email, subscriber_name, result["pdf_path"], result["ics_path"],
+            period_label, result["peak_decision_day"], len(result["standdown_days"]),
+        )
     except Exception as e:
         notify_failure("Report generation failed", f"{customer_email}: {repr(e)}")
         return jsonify({"received": True, "error": "generation failed"}), 200
@@ -307,7 +356,10 @@ def generate_report(dob_str, start_date):
     render_simple_pdf(data, pdf_path)
     render_ics(data, ics_path)
 
-    return {"period": data["period"], "pdf_path": pdf_path, "ics_path": ics_path}
+    return {
+        "period": data["period"], "pdf_path": pdf_path, "ics_path": ics_path,
+        "peak_decision_day": data["peak_decision_day"], "standdown_days": data["standdown_days"],
+    }
 
 
 def render_simple_pdf(data, output_path):
