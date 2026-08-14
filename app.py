@@ -217,17 +217,32 @@ def stripe_webhook():
     event = json.loads(payload)
     event_type = event.get("type")
 
-    if event_type != "checkout.session.completed":
+    # checkout.session.completed = the FIRST payment (initial signup).
+    # invoice.paid = every RENEWAL payment thereafter (month 2, 3, 4...).
+    # Both must be handled, or reports stop after the first month.
+    if event_type == "checkout.session.completed":
+        obj = event["data"]["object"]
+        customer_email = obj.get("customer_details", {}).get("email") or obj.get("customer_email")
+        customer_name = obj.get("customer_details", {}).get("name", "")
+        paid = obj.get("payment_status") == "paid"
+        paid_at_ts = obj.get("created")
+    elif event_type == "invoice.paid":
+        obj = event["data"]["object"]
+        customer_email = obj.get("customer_email")
+        customer_name = obj.get("customer_name", "")
+        paid = obj.get("status") == "paid"
+        # Use the invoice's period start (when this billing cycle began) so
+        # the report window starts the day after THIS charge, not today's
+        # server time — keeps cycles rolling correctly even if the webhook
+        # is processed slightly late.
+        paid_at_ts = obj.get("status_transitions", {}).get("paid_at") or obj.get("created")
+    else:
         return jsonify({"received": True, "ignored": event_type}), 200
 
-    session = event["data"]["object"]
-    customer_email = session.get("customer_details", {}).get("email") or session.get("customer_email")
-    payment_status = session.get("payment_status")
-
-    if payment_status != "paid":
+    if not paid:
         return jsonify({"received": True, "ignored": "not paid yet"}), 200
     if not customer_email:
-        notify_failure("No email on paid session", f"Session {session.get('id')} paid but had no customer email.")
+        notify_failure("No email on paid event", f"{event_type} paid but had no customer email.")
         return jsonify({"received": True, "error": "no email"}), 200
 
     api_key = os.environ.get("MAILERLITE_API_KEY")
@@ -235,25 +250,24 @@ def stripe_webhook():
     if not dob:
         notify_failure(
             "Paid but no DOB on file",
-            f"{customer_email} completed payment but has no date_of_birth in MailerLite. "
+            f"{customer_email} completed payment ({event_type}) but has no date_of_birth in MailerLite. "
             f"Likely used a different email at checkout than on the intake form. "
             f"Follow up manually to collect DOB and generate their report by hand.",
         )
         return jsonify({"received": True, "error": "no dob on file"}), 200
 
-    paid_at = datetime.utcfromtimestamp(session["created"])
+    paid_at = datetime.utcfromtimestamp(paid_at_ts)
     start_date = (paid_at + timedelta(days=1)).date()
 
     try:
         result = generate_report(dob, start_date)
         period_label = f"{result['period']['start_date']} to {result['period']['end_date']}"
-        subscriber_name = session.get("customer_details", {}).get("name", "")
         send_report_email(
-            customer_email, subscriber_name, result["pdf_path"], result["ics_path"],
+            customer_email, customer_name, result["pdf_path"], result["ics_path"],
             period_label, result["peak_decision_day"], len(result["standdown_days"]),
         )
     except Exception as e:
-        notify_failure("Report generation failed", f"{customer_email}: {repr(e)}")
+        notify_failure("Report generation failed", f"{customer_email} ({event_type}): {repr(e)}")
         return jsonify({"received": True, "error": "generation failed"}), 200
 
     return jsonify({"received": True, "sent": True}), 200
