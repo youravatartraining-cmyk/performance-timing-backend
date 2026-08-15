@@ -20,6 +20,7 @@ Required environment variables (Render dashboard, never in code):
                             generate at myaccount.google.com/apppasswords
                             (requires 2-Step Verification turned on first)
   NOTIFY_EMAIL             — where failure alerts go (Robert's own inbox)
+  TEST_KEY                 — secret string guarding /api/test-report
 """
 
 import os
@@ -27,6 +28,7 @@ import re
 import json
 import smtplib
 import tempfile
+import traceback
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 
@@ -125,7 +127,7 @@ def notify_failure(reason, detail):
             smtp.login(address, app_password)
             smtp.send_message(msg)
     except Exception:
-        pass
+        pass  # this IS the failure path — nowhere further to escalate to
 
 
 def send_report_email(to_email, subscriber_name, pdf_path, ics_path, period_label, peak_date, standdown_count):
@@ -266,8 +268,7 @@ def stripe_webhook():
             customer_email, customer_name, result["pdf_path"], result["ics_path"],
             period_label, result["peak_decision_day"], len(result["standdown_days"]),
         )
-   except Exception:
-        import traceback
+    except Exception:
         notify_failure("Report generation failed",
                        f"{customer_email} ({event_type}):\n{traceback.format_exc()}")
         return jsonify({"received": True, "error": "generation failed"}), 200
@@ -482,24 +483,35 @@ def render_ics(data, output_path):
     with open(output_path, "w", newline="") as f:
         f.write("\r\n".join(lines) + "\r\n")
 
+
 @app.route("/api/test-report", methods=["GET"])
 def test_report():
+    """Manual end-to-end test — no Stripe, no payment.
+    Call: /api/test-report?key=TEST_KEY&dob=1985-03-12&email=you@example.com
+    Returns the full traceback in the browser if anything fails."""
     if request.args.get("key") != os.environ.get("TEST_KEY"):
         return jsonify({"error": "unauthorized"}), 403
-    import traceback
+
+    dob = request.args.get("dob")
+    email = request.args.get("email")
+    if not dob or not DOB_PATTERN.match(dob):
+        return jsonify({"error": "dob missing or not YYYY-MM-DD"}), 400
+    if not email:
+        return jsonify({"error": "email missing"}), 400
+
     try:
         start = (datetime.utcnow() + timedelta(days=1)).date()
-        result = generate_report(request.args.get("dob"), start)
+        result = generate_report(dob, start)
         label = f"{result['period']['start_date']} to {result['period']['end_date']}"
         send_report_email(
-            request.args.get("email"), "Test",
-            result["pdf_path"], result["ics_path"], label,
+            email, "Test", result["pdf_path"], result["ics_path"], label,
             result["peak_decision_day"], len(result["standdown_days"]),
         )
-        return jsonify({"ok": True, "period": label})
+        return jsonify({"ok": True, "period": label, "sent_to": email})
     except Exception:
         return jsonify({"ok": False, "trace": traceback.format_exc()}), 500
-      
+
+
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "performance-timing-backend"})
