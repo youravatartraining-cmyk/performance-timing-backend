@@ -266,8 +266,10 @@ def stripe_webhook():
             customer_email, customer_name, result["pdf_path"], result["ics_path"],
             period_label, result["peak_decision_day"], len(result["standdown_days"]),
         )
-    except Exception as e:
-        notify_failure("Report generation failed", f"{customer_email} ({event_type}): {repr(e)}")
+   except Exception:
+        import traceback
+        notify_failure("Report generation failed",
+                       f"{customer_email} ({event_type}):\n{traceback.format_exc()}")
         return jsonify({"received": True, "error": "generation failed"}), 200
 
     return jsonify({"received": True, "sent": True}), 200
