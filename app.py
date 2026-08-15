@@ -121,7 +121,7 @@ def notify_failure(reason, detail):
         msg["From"] = address
         msg["To"] = notify_to
         msg.set_content(f"{reason}\n\n{detail}")
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+      with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as smtp:
             smtp.login(address, app_password)
             smtp.send_message(msg)
     except Exception:
@@ -196,7 +196,7 @@ def send_report_email(to_email, subscriber_name, pdf_path, ics_path, period_labe
         msg.add_attachment(f.read(), maintype="text", subtype="calendar",
                             filename=os.path.basename(ics_path))
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as smtp:
         smtp.login(address, app_password)
         smtp.send_message(msg)
 
