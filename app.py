@@ -41,6 +41,16 @@ MAILERLITE_GROUP_ID = "195545324381538237"  # Performance Timing Subscribers
 DOB_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
+def fmt_long(iso_date):
+    """2026-09-15 -> 15 September 2026. Display only — never used for logic."""
+    return datetime.strptime(iso_date, "%Y-%m-%d").strftime("%d %B %Y").lstrip("0")
+
+
+def fmt_short(iso_date):
+    """2026-09-15 -> 15-09-2026. For dense table rows."""
+    return datetime.strptime(iso_date, "%Y-%m-%d").strftime("%d-%m-%Y")
+
+
 def cors_headers(resp):
     resp.headers["Access-Control-Allow-Origin"] = "https://avtrlife.com"
     resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
@@ -263,7 +273,8 @@ def stripe_webhook():
 
     try:
         result = generate_report(dob, start_date)
-        period_label = f"{result['period']['start_date']} to {result['period']['end_date']}"
+        period_label = (f"{fmt_long(result['period']['start_date'])} to "
+                        f"{fmt_long(result['period']['end_date'])}")
         send_report_email(
             customer_email, customer_name, result["pdf_path"], result["ics_path"],
             period_label, result["peak_decision_day"], len(result["standdown_days"]),
@@ -424,7 +435,9 @@ def render_simple_pdf(data, output_path):
     c.setFillColor(CREAM); c.setFont(f("Cormorant-Bold", "Times-Bold"), 32)
     c.drawCentredString(W/2, H-80*mm, "Performance Timing")
     c.setFillColor(GOLD); c.setFont(f("Cormorant-Italic", "Times-Italic"), 13)
-    c.drawCentredString(W/2, H-90*mm, f"{data['period']['start_date']} to {data['period']['end_date']}")
+    c.drawCentredString(W/2, H-90*mm,
+                        f"{fmt_long(data['period']['start_date'])} to "
+                        f"{fmt_long(data['period']['end_date'])}")
     c.showPage()
 
     c.setFillColor(CREAM); c.rect(0, 0, W, H, fill=1, stroke=0)
@@ -432,12 +445,12 @@ def render_simple_pdf(data, output_path):
     c.setFillColor(NAVY); c.setFont(f("Cormorant-Bold", "Times-Bold"), 18)
     c.drawString(18*mm, y, "Peak Decision Day"); y -= 10*mm
     c.setFont(f("DMSans", "Times-Roman"), 13)
-    c.drawString(18*mm, y, data["peak_decision_day"]); y -= 16*mm
+    c.drawString(18*mm, y, fmt_long(data["peak_decision_day"])); y -= 16*mm
     c.setFont(f("Cormorant-Bold", "Times-Bold"), 14)
     c.drawString(18*mm, y, "Rest & Recovery Days"); y -= 8*mm
     c.setFont(f("DMSans", "Times-Roman"), 10)
     for sd in data["standdown_days"]:
-        c.drawString(18*mm, y, f"- {sd}"); y -= 6*mm
+        c.drawString(18*mm, y, f"- {fmt_long(sd)}"); y -= 6*mm
         if y < 20*mm:
             c.showPage(); c.setFillColor(CREAM); c.rect(0,0,W,H,fill=1,stroke=0); y = H-25*mm
     c.showPage()
@@ -451,7 +464,7 @@ def render_simple_pdf(data, output_path):
         if y < 20*mm:
             c.showPage(); c.setFillColor(CREAM); c.rect(0,0,W,H,fill=1,stroke=0); y = H-25*mm
             c.setFillColor(NAVY); c.setFont(f("SpaceMono", "Helvetica-Bold"), 8)
-        line = f"{day['date']} ({day['weekday'][:3]}): " + " | ".join(
+        line = f"{fmt_short(day['date'])} ({day['weekday'][:3]}): " + " | ".join(
             f"{k[:4]}:{v['verdict'][:3]}" for k, v in day["categories"].items()
         )
         c.setFillColor(NAVY)
@@ -502,7 +515,8 @@ def test_report():
     try:
         start = (datetime.utcnow() + timedelta(days=1)).date()
         result = generate_report(dob, start)
-        label = f"{result['period']['start_date']} to {result['period']['end_date']}"
+        label = (f"{fmt_long(result['period']['start_date'])} to "
+                 f"{fmt_long(result['period']['end_date'])}")
         send_report_email(
             email, "Test", result["pdf_path"], result["ics_path"], label,
             result["peak_decision_day"], len(result["standdown_days"]),
