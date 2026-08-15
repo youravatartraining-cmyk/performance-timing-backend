@@ -242,7 +242,7 @@ def build_and_send(customer_email, customer_name, dob, start_date, event_type):
     waiting after roughly 10 seconds and marks the delivery failed, then
     retries; doing this work inline is what would cause duplicate sends."""
     try:
-        result = generate_report(dob, start_date)
+        result = generate_report(dob, start_date, customer_name)
         period_label = (f"{fmt_long(result['period']['start_date'])} to "
                         f"{fmt_long(result['period']['end_date'])}")
         send_report_email(
@@ -333,7 +333,7 @@ def stripe_webhook():
     return jsonify({"received": True, "queued": True}), 200
 
 
-def generate_report(dob_str, start_date):
+def generate_report(dob_str, start_date, subscriber_name=""):
     import sxtwl
     from dateutil.relativedelta import relativedelta
 
@@ -416,7 +416,7 @@ def generate_report(dob_str, start_date):
     standdown_days = [x["date"] for x in daily if x["categories"]["rest"]["verdict"] == "favorable"]
 
     data = {
-        "subscriber": {"name": "", "date_of_birth": dob_str},
+        "subscriber": {"name": subscriber_name, "date_of_birth": dob_str},
         "period": {"start_date": start_date.isoformat(), "end_date": end_date.isoformat()},
         "daily": daily,
         "peak_decision_day": peak_day["date"],
@@ -436,13 +436,60 @@ def generate_report(dob_str, start_date):
     }
 
 
+# =============================================================================
+# PDF RENDERER
+# Ported from the performance-timing skill's full renderer so the automated
+# report and any manually-generated one look identical. Structure: cover,
+# "How to Read This" explainer, Month at a Glance, daily grid, closing.
+# Brand colours match avtrlife.com exactly (assets/branding.md).
+# =============================================================================
+
+CATEGORY_ORDER = ["conversations", "commitments", "money", "launches", "rest"]
+
+CATEGORY_LABELS = {
+    "conversations": "Conversations & Meetings",
+    "commitments": "Commitments & Contracts",
+    "money": "Money Moves",
+    "launches": "Starting Something New",
+    "rest": "Rest & Recovery",
+}
+
+CATEGORY_DESCRIPTIONS = {
+    "conversations": "Difficult conversations, first meetings, and negotiations.",
+    "commitments": "Signing, agreeing, and formal commitments of any kind.",
+    "money": "Financial decisions \u2014 asks, spending, negotiating, investing.",
+    "launches": "New projects, habits, or ventures \u2014 the first move on something.",
+    "rest": "Whether to push today, or ease off and protect your energy.",
+}
+
+CATEGORY_GRID_HEADER = {
+    "conversations": ("Conversations", "& Meetings"),
+    "commitments": ("Commitments", "& Contracts"),
+    "money": ("Money", "Moves"),
+    "launches": ("New", "Starts"),
+    "rest": ("Rest &", "Recovery"),
+}
+
+VERDICT_SHORT = {"favorable": "Favorable", "neutral": "Neutral", "avoid": "Avoid"}
+
+MONTH_NAMES = ["", "January", "February", "March", "April", "May", "June",
+               "July", "August", "September", "October", "November", "December"]
+
+
+def format_period_label(period):
+    """Rolling-window range, e.g. '22 Aug \u2013 21 Sep 2026'."""
+    start = datetime.strptime(period["start_date"], "%Y-%m-%d")
+    end = datetime.strptime(period["end_date"], "%Y-%m-%d")
+    if start.year == end.year:
+        return (f"{start.day} {MONTH_NAMES[start.month][:3]} \u2013 "
+                f"{end.day} {MONTH_NAMES[end.month][:3]} {end.year}")
+    return (f"{start.day} {MONTH_NAMES[start.month][:3]} {start.year} \u2013 "
+            f"{end.day} {MONTH_NAMES[end.month][:3]} {end.year}")
+
+
 def render_simple_pdf(data, output_path):
-    """Uses the real Avatar Training brand fonts (Cormorant Garamond, Space
-    Mono, DM Sans), bundled directly in this repo's fonts/ folder as static
-    weight instances extracted from Google's variable font files — so
-    rendering doesn't depend on what happens to be installed on the server.
-    See fonts/README.md for how these were generated if they ever need
-    regenerating (e.g. a new weight)."""
+    """Name kept for backwards compatibility with existing call sites.
+    No longer 'simple' \u2014 this is the full branded report."""
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas
     from reportlab.lib.units import mm
@@ -452,71 +499,378 @@ def render_simple_pdf(data, output_path):
 
     FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
     for name, filename in [
-        ("Cormorant", "CormorantGaramond-Regular.ttf"),
-        ("Cormorant-Bold", "CormorantGaramond-Bold.ttf"),
-        ("Cormorant-Italic", "CormorantGaramond-Italic.ttf"),
-        ("DMSans", "DMSans-Regular.ttf"),
-        ("DMSans-Bold", "DMSans-Bold.ttf"),
-        ("SpaceMono", "SpaceMono-Regular.ttf"),
-        ("SpaceMono-Bold", "SpaceMono-Bold.ttf"),
+        ("Display", "CormorantGaramond-Regular.ttf"),
+        ("Display-Bold", "CormorantGaramond-Bold.ttf"),
+        ("Display-Italic", "CormorantGaramond-Italic.ttf"),
+        ("Mono", "SpaceMono-Regular.ttf"),
+        ("Mono-Bold", "SpaceMono-Bold.ttf"),
+        ("Body", "DMSans-Regular.ttf"),
+        ("Body-Bold", "DMSans-Bold.ttf"),
     ]:
         try:
             pdfmetrics.registerFont(TTFont(name, os.path.join(FONT_DIR, filename)))
         except Exception:
-            pass  # falls through to base-14 names below if a font is missing
+            pass
 
-    def f(brand_name, fallback):
-        """Use the brand font if it registered successfully, otherwise the
-        reportlab base-14 fallback — keeps this from crashing in production
-        even if a font file is ever missing."""
-        return brand_name if brand_name in pdfmetrics.getRegisteredFontNames() else fallback
+    FALLBACK = {
+        "Display": "Times-Roman", "Display-Bold": "Times-Bold",
+        "Display-Italic": "Times-Italic", "Mono": "Courier",
+        "Mono-Bold": "Courier-Bold", "Body": "Helvetica",
+        "Body-Bold": "Helvetica-Bold",
+    }
+    registered = set(pdfmetrics.getRegisteredFontNames())
 
-    NAVY, GOLD, CREAM = HexColor("#0A0A08"), HexColor("#C9A84C"), HexColor("#F5F2E8")
+    def F(name):
+        """Brand font if it registered, otherwise a base-14 equivalent \u2014
+        keeps production from crashing if a font file goes missing."""
+        return name if name in registered else FALLBACK[name]
+
+    NAVY = HexColor("#0A0A08")
+    GOLD = HexColor("#C9A84C")
+    CREAM = HexColor("#F5F2E8")
+    BODY_TEXT = HexColor("#1A1A1A")
+    META_TEXT = HexColor("#3A362E")
+    NEUTRAL_MARK = HexColor("#6E6A58")
+    HAIRLINE = HexColor("#DDD5C5")
+
+    # Traffic-light verdict colours. Deliberately muted rather than pure
+    # signal colours so they sit on cream without shouting. The verdict WORD
+    # is always printed alongside the dot — colour reinforces meaning, it
+    # never carries it alone, which keeps the grid readable for the ~8% of
+    # men with red/green colour deficiency.
+    GO = HexColor("#3E7D4F")       # favorable
+    CAUTION = HexColor("#D9971E")  # neutral
+    STOP = HexColor("#C0392B")     # avoid
+
+    PAGE_W, PAGE_H = A4
+    MARGIN = 18 * mm
+
+    period_label = format_period_label(data["period"])
+    name = data["subscriber"].get("name") or "Subscriber"
+
+    def verdict_color(v):
+        if v == "favorable":
+            return GO
+        if v == "avoid":
+            return STOP
+        return CAUTION
+
+    def page_header(section_name):
+        c.setFillColor(CREAM)
+        c.rect(0, 0, PAGE_W, PAGE_H, fill=1, stroke=0)
+        top = PAGE_H - MARGIN
+        c.setFillColor(GOLD)
+        c.setFont(F("Mono"), 8)
+        c.drawString(MARGIN, top, "AVATAR TRAINING \u2014 PERFORMANCE TIMING")
+        c.drawRightString(PAGE_W - MARGIN, top, section_name.upper())
+        c.setStrokeColor(GOLD)
+        c.setLineWidth(0.5)
+        c.line(MARGIN, top - 3 * mm, PAGE_W - MARGIN, top - 3 * mm)
+
+    def page_footer(page_num):
+        fy = MARGIN - 4 * mm
+        c.setStrokeColor(GOLD)
+        c.setLineWidth(0.5)
+        c.line(MARGIN, fy + 5 * mm, PAGE_W - MARGIN, fy + 5 * mm)
+        c.setFillColor(META_TEXT)
+        c.setFont(F("Mono"), 7.5)
+        c.drawString(MARGIN, fy, f"{name} \u00b7 {period_label}")
+        c.drawRightString(PAGE_W - MARGIN, fy, f"Page {page_num}")
+
     c = canvas.Canvas(output_path, pagesize=A4)
-    W, H = A4
+    cx = PAGE_W / 2
 
-    c.setFillColor(NAVY); c.rect(0, 0, W, H, fill=1, stroke=0)
-    c.setFillColor(GOLD); c.setFont(f("SpaceMono", "Helvetica"), 10)
-    c.drawCentredString(W/2, H-60*mm, "AVATAR TRAINING")
-    c.setFillColor(CREAM); c.setFont(f("Cormorant-Bold", "Times-Bold"), 32)
-    c.drawCentredString(W/2, H-80*mm, "Performance Timing")
-    c.setFillColor(GOLD); c.setFont(f("Cormorant-Italic", "Times-Italic"), 13)
-    c.drawCentredString(W/2, H-90*mm,
-                        f"{fmt_long(data['period']['start_date'])} to "
-                        f"{fmt_long(data['period']['end_date'])}")
+    # ---------- COVER ----------
+    c.setFillColor(NAVY)
+    c.rect(0, 0, PAGE_W, PAGE_H, fill=1, stroke=0)
+    y = PAGE_H - 60 * mm
+    c.setFillColor(GOLD)
+    c.setFont(F("Mono"), 10)
+    c.drawCentredString(cx, y, "A V A T A R   T R A I N I N G")
+    y -= 18 * mm
+    c.setStrokeColor(GOLD)
+    c.setLineWidth(0.75)
+    c.line(cx - 20 * mm, y, cx + 20 * mm, y)
+    y -= 18 * mm
+    c.setFillColor(CREAM)
+    c.setFont(F("Display-Bold"), 40)
+    c.drawCentredString(cx, y, "Performance Timing")
+    y -= 10 * mm
+    c.setFillColor(GOLD)
+    c.setFont(F("Display-Italic"), 14)
+    c.drawCentredString(cx, y, period_label)
+    y -= 30 * mm
+    c.setFillColor(CREAM)
+    c.setFont(F("Display"), 20)
+    c.drawCentredString(cx, y, name)
+    y -= 10 * mm
+    c.setFont(F("Mono"), 8.5)
+    c.drawCentredString(cx, y, f"Prepared {datetime.now().strftime('%d %B %Y')}")
+    fy = 35 * mm
+    c.setStrokeColor(GOLD)
+    c.line(MARGIN, fy, PAGE_W - MARGIN, fy)
+    c.setFillColor(GOLD)
+    c.setFont(F("Mono"), 8)
+    c.drawCentredString(cx, fy - 8 * mm,
+                        "L . I . T . A .   \u00b7   L O V E   I S   T H E   A N S W E R")
     c.showPage()
 
-    c.setFillColor(CREAM); c.rect(0, 0, W, H, fill=1, stroke=0)
-    y = H - 25*mm
-    c.setFillColor(NAVY); c.setFont(f("Cormorant-Bold", "Times-Bold"), 18)
-    c.drawString(18*mm, y, "Peak Decision Day"); y -= 10*mm
-    c.setFont(f("DMSans", "Times-Roman"), 13)
-    c.drawString(18*mm, y, fmt_long(data["peak_decision_day"])); y -= 16*mm
-    c.setFont(f("Cormorant-Bold", "Times-Bold"), 14)
-    c.drawString(18*mm, y, "Rest & Recovery Days"); y -= 8*mm
-    c.setFont(f("DMSans", "Times-Roman"), 10)
-    for sd in data["standdown_days"]:
-        c.drawString(18*mm, y, f"- {fmt_long(sd)}"); y -= 6*mm
-        if y < 20*mm:
-            c.showPage(); c.setFillColor(CREAM); c.rect(0,0,W,H,fill=1,stroke=0); y = H-25*mm
-    c.showPage()
+    # ---------- HOW TO READ THIS ----------
+    page_header("How to Read This")
+    y = PAGE_H - MARGIN - 20 * mm
+    c.setFillColor(NAVY)
+    c.setFont(F("Display-Bold"), 20)
+    c.drawString(MARGIN, y, "How to Read This Calendar")
+    y -= 10 * mm
+    c.setFillColor(META_TEXT)
+    c.setFont(F("Display"), 12)
+    c.drawString(MARGIN, y,
+                 "Every day this month is scored across five areas of decision-making.")
+    y -= 18 * mm
 
-    c.setFillColor(CREAM); c.rect(0, 0, W, H, fill=1, stroke=0)
-    y = H - 25*mm
-    c.setFillColor(NAVY); c.setFont(f("Cormorant-Bold", "Times-Bold"), 16)
-    c.drawString(18*mm, y, "Daily Timing"); y -= 12*mm
-    c.setFont(f("SpaceMono", "Helvetica-Bold"), 8)
-    for day in data["daily"]:
-        if y < 20*mm:
-            c.showPage(); c.setFillColor(CREAM); c.rect(0,0,W,H,fill=1,stroke=0); y = H-25*mm
-            c.setFillColor(NAVY); c.setFont(f("SpaceMono", "Helvetica-Bold"), 8)
-        line = f"{fmt_short(day['date'])} ({day['weekday'][:3]}): " + " | ".join(
-            f"{k[:4]}:{v['verdict'][:3]}" for k, v in day["categories"].items()
-        )
+    for cat in CATEGORY_ORDER:
+        c.setStrokeColor(GOLD)
+        c.setLineWidth(0.5)
+        c.line(MARGIN, y, MARGIN + 3 * mm, y)
         c.setFillColor(NAVY)
-        c.drawString(18*mm, y, line)
-        y -= 6*mm
+        c.setFont(F("Display-Bold"), 14.5)
+        c.drawString(MARGIN + 6 * mm, y - 1 * mm, CATEGORY_LABELS[cat])
+        y -= 7 * mm
+        c.setFillColor(META_TEXT)
+        c.setFont(F("Display-Italic"), 11.5)
+        c.drawString(MARGIN + 6 * mm, y, CATEGORY_DESCRIPTIONS[cat])
+        y -= 14 * mm
+
+    y -= 4 * mm
+    c.setStrokeColor(GOLD)
+    c.setLineWidth(0.5)
+    c.line(MARGIN, y, PAGE_W - MARGIN, y)
+    y -= 11 * mm
+    c.setFillColor(NAVY)
+    c.setFont(F("Mono-Bold"), 10.5)
+    c.drawString(MARGIN, y, "READING THE MARKS")
+    y -= 9 * mm
+
+    for color, term, desc in [
+        (GO, "Favorable", "Lean into this \u2014 a stronger-than-usual window for this category."),
+        (CAUTION, "Neutral", "No particular signal either way \u2014 use ordinary judgement."),
+        (STOP, "Avoid", "Not the day to force this \u2014 where possible, hold off or reschedule."),
+    ]:
+        c.setFillColor(color)
+        c.circle(MARGIN + 1.5 * mm, y + 1 * mm, 1.7 * mm, fill=1, stroke=0)
+        c.setFillColor(NAVY)
+        c.setFont(F("Mono-Bold"), 11.5)
+        c.drawString(MARGIN + 7 * mm, y, term)
+        c.setFillColor(META_TEXT)
+        c.setFont(F("Display-Italic"), 11)
+        c.drawString(MARGIN + 34 * mm, y, desc)
+        y -= 9 * mm
+
+    page_footer(2)
     c.showPage()
+
+    # ---------- MONTH AT A GLANCE ----------
+    page_header("Month at a Glance")
+    y = PAGE_H - MARGIN - 20 * mm
+    c.setFillColor(NAVY)
+    c.setFont(F("Display-Bold"), 20)
+    c.drawString(MARGIN, y, "Month at a Glance")
+    y -= 14 * mm
+
+    box_h = 28 * mm
+    c.setFillColor(GOLD)
+    c.rect(MARGIN, y - box_h, PAGE_W - 2 * MARGIN, box_h, fill=1, stroke=0)
+    c.setFillColor(NAVY)
+    c.setFont(F("Mono-Bold"), 10)
+    c.drawString(MARGIN + 8 * mm, y - 8 * mm, "PEAK DECISION DAY")
+    c.setFont(F("Display-Bold"), 20)
+    peak_dt = datetime.strptime(data["peak_decision_day"], "%Y-%m-%d")
+    c.drawString(MARGIN + 8 * mm, y - 18 * mm, peak_dt.strftime("%A, %d %B"))
+    c.setFont(F("Display"), 11.5)
+    c.drawString(MARGIN + 8 * mm, y - 25 * mm,
+                 "If you have a choice about timing this month, this is the day to use it.")
+    y -= box_h + 14 * mm
+
+    c.setFillColor(NAVY)
+    c.setFont(F("Mono-Bold"), 12.5)
+    c.drawString(MARGIN, y, "REST & RECOVERY DAYS")
+    y -= 7 * mm
+    c.setFillColor(META_TEXT)
+    c.setFont(F("Display"), 11.5)
+    c.drawString(MARGIN, y,
+                 "These are the days this month best suited to protecting your "
+                 "capacity rather than pushing it.")
+    y -= 11 * mm
+
+    col_width = 55 * mm
+    row_h = 8 * mm
+    for i, iso_date in enumerate(data["standdown_days"]):
+        x = MARGIN + (i % 3) * col_width
+        yy = y - (i // 3) * row_h
+        dt = datetime.strptime(iso_date, "%Y-%m-%d")
+        c.setFillColor(NAVY)
+        c.setFont(F("Body"), 11)
+        c.drawString(x, yy, "\u2022  " + dt.strftime("%a %d %b"))
+
+    y -= ((len(data["standdown_days"]) + 2) // 3) * row_h + 14 * mm
+
+    # Month summary — how many favorable days fall in each category. Gives
+    # the subscriber something to act on at a glance without reading the
+    # full grid, and stops this page ending in dead space.
+    c.setStrokeColor(GOLD)
+    c.setLineWidth(0.5)
+    c.line(MARGIN, y, PAGE_W - MARGIN, y)
+    y -= 11 * mm
+    c.setFillColor(NAVY)
+    c.setFont(F("Mono-Bold"), 12.5)
+    c.drawString(MARGIN, y, "FAVORABLE DAYS THIS CYCLE")
+    y -= 7 * mm
+    c.setFillColor(META_TEXT)
+    c.setFont(F("Display"), 11.5)
+    c.drawString(MARGIN, y,
+                 "How many days this cycle carry a strong signal in each area.")
+    y -= 12 * mm
+
+    total_days = len(data["daily"])
+    for cat in CATEGORY_ORDER:
+        count = sum(1 for d in data["daily"]
+                    if d["categories"][cat]["verdict"] == "favorable")
+        c.setFillColor(NAVY)
+        c.setFont(F("Display"), 12.5)
+        c.drawString(MARGIN + 6 * mm, y, CATEGORY_LABELS[cat])
+
+        # Proportional bar — quiet, gold, no solid blocks of colour
+        bar_x = MARGIN + 78 * mm
+        bar_w = 62 * mm
+        c.setStrokeColor(HAIRLINE)
+        c.setLineWidth(0.5)
+        c.line(bar_x, y - 1 * mm, bar_x + bar_w, y - 1 * mm)
+        if total_days:
+            c.setStrokeColor(GOLD)
+            c.setLineWidth(2.2)
+            c.line(bar_x, y - 1 * mm,
+                   bar_x + bar_w * (count / total_days), y - 1 * mm)
+
+        c.setFillColor(META_TEXT)
+        c.setFont(F("Mono-Bold"), 10)
+        c.drawRightString(PAGE_W - MARGIN, y, f"{count} of {total_days}")
+        y -= 10 * mm
+
+    page_footer(3)
+    c.showPage()
+
+    # ---------- DAILY GRID ----------
+    daily = data["daily"]
+    # Split evenly across two pages rather than filling the first and
+    # leaving the second half-empty — a page with dead space at the bottom
+    # reads as unfinished.
+    rows_per_page = -(-len(daily) // 2)
+    row_h = 13 * mm
+    page_num = 4
+    idx = 0
+    date_col_w = 32 * mm
+    cat_col_w = (PAGE_W - 2 * MARGIN - date_col_w) / 5
+
+    while idx < len(daily):
+        page_header("Monthly Calendar")
+        y = PAGE_H - MARGIN - 16 * mm
+        c.setFillColor(NAVY)
+        c.setFont(F("Display-Bold"), 17)
+        c.drawString(MARGIN, y, "Daily Timing")
+        y -= 13 * mm
+
+        c.setFillColor(META_TEXT)
+        c.setFont(F("Mono-Bold"), 8.5)
+        x = MARGIN
+        c.drawString(x, y, "DATE")
+        x += date_col_w
+        for cat in CATEGORY_ORDER:
+            line1, line2 = CATEGORY_GRID_HEADER[cat]
+            ccx = x + cat_col_w / 2
+            c.drawCentredString(ccx, y, line1)
+            c.drawCentredString(ccx, y - 3.5 * mm, line2)
+            x += cat_col_w
+        y -= 9 * mm
+        c.setStrokeColor(GOLD)
+        c.setLineWidth(0.75)
+        c.line(MARGIN, y, PAGE_W - MARGIN, y)
+        y -= 11 * mm
+
+        rows_this_page = 0
+        while idx < len(daily) and rows_this_page < rows_per_page:
+            day = daily[idx]
+            dt = datetime.strptime(day["date"], "%Y-%m-%d")
+            is_peak = day["date"] == data["peak_decision_day"]
+
+            x = MARGIN
+            c.setFillColor(NAVY if is_peak else BODY_TEXT)
+            c.setFont(F("Display-Bold") if is_peak else F("Display"), 11.5)
+            c.drawString(x, y, dt.strftime("%a %d %b"))
+            if is_peak:
+                c.setFillColor(GOLD)
+                c.setFont(F("Mono-Bold"), 7.5)
+                c.drawString(x, y - 4.5 * mm, "PEAK DAY")
+            x += date_col_w
+
+            for cat in CATEGORY_ORDER:
+                verdict = day["categories"][cat]["verdict"]
+                marker = verdict_color(verdict)
+                ccx = x + cat_col_w / 2
+                label = VERDICT_SHORT[verdict]
+
+                # Marker sits inline, immediately left of the word. Stacking
+                # it above the text made it ambiguous which row it belonged
+                # to once the rows were tightened.
+                c.setFont(F("Mono-Bold"), 9.5)
+                text_w = c.stringWidth(label, F("Mono-Bold"), 9.5)
+                dot_r = 1.15 * mm
+                gap = 1.8 * mm
+                block_w = dot_r * 2 + gap + text_w
+                block_x = ccx - block_w / 2
+
+                c.setFillColor(marker)
+                c.circle(block_x + dot_r, y + 1.1 * mm, dot_r, fill=1, stroke=0)
+                c.setFillColor(marker)
+                c.drawString(block_x + dot_r * 2 + gap, y, label)
+                x += cat_col_w
+
+            y -= row_h
+            c.setStrokeColor(HAIRLINE)
+            c.setLineWidth(0.4)
+            c.line(MARGIN, y + 5 * mm, PAGE_W - MARGIN, y + 5 * mm)
+            idx += 1
+            rows_this_page += 1
+
+        page_footer(page_num)
+        c.showPage()
+        page_num += 1
+
+    # ---------- CLOSING ----------
+    c.setFillColor(NAVY)
+    c.rect(0, 0, PAGE_W, PAGE_H, fill=1, stroke=0)
+    y = PAGE_H / 2 + 20 * mm
+    c.setStrokeColor(GOLD)
+    c.setLineWidth(0.75)
+    c.line(cx - 20 * mm, y, cx + 20 * mm, y)
+    y -= 14 * mm
+    c.setFillColor(CREAM)
+    c.setFont(F("Display-Bold"), 26)
+    c.drawCentredString(cx, y, "L.I.T.A.")
+    y -= 8 * mm
+    c.setFillColor(GOLD)
+    c.setFont(F("Display-Italic"), 12)
+    c.drawCentredString(cx, y, "Love Is The Answer")
+    y -= 24 * mm
+    c.setFillColor(CREAM)
+    c.setFont(F("Display"), 10)
+    c.drawCentredString(cx, y, "Did you act on your Peak Decision Day this month?")
+    y -= 6 * mm
+    c.drawCentredString(cx, y, "Reply and let us know \u2014 we'd love to hear how it went.")
+    c.setFillColor(GOLD)
+    c.setFont(F("Mono"), 9)
+    c.drawCentredString(cx, 30 * mm, "avtrlife.com  \u00b7  hello@avtrlife.com")
+    c.showPage()
+
     c.save()
 
 
@@ -560,7 +914,7 @@ def test_report():
 
     try:
         start = (datetime.utcnow() + timedelta(days=1)).date()
-        result = generate_report(dob, start)
+        result = generate_report(dob, start, request.args.get("name", "Test"))
         label = (f"{fmt_long(result['period']['start_date'])} to "
                  f"{fmt_long(result['period']['end_date'])}")
         send_report_email(
