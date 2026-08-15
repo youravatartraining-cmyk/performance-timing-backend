@@ -482,7 +482,24 @@ def render_ics(data, output_path):
     with open(output_path, "w", newline="") as f:
         f.write("\r\n".join(lines) + "\r\n")
 
-
+@app.route("/api/test-report", methods=["GET"])
+def test_report():
+    if request.args.get("key") != os.environ.get("TEST_KEY"):
+        return jsonify({"error": "unauthorized"}), 403
+    import traceback
+    try:
+        start = (datetime.utcnow() + timedelta(days=1)).date()
+        result = generate_report(request.args.get("dob"), start)
+        label = f"{result['period']['start_date']} to {result['period']['end_date']}"
+        send_report_email(
+            request.args.get("email"), "Test",
+            result["pdf_path"], result["ics_path"], label,
+            result["peak_decision_day"], len(result["standdown_days"]),
+        )
+        return jsonify({"ok": True, "period": label})
+    except Exception:
+        return jsonify({"ok": False, "trace": traceback.format_exc()}), 500
+      
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "performance-timing-backend"})
