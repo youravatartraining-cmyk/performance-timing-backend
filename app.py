@@ -28,6 +28,7 @@ import re
 import json
 import smtplib
 import tempfile
+import threading
 import traceback
 from datetime import datetime, timedelta
 from email.message import EmailMessage
@@ -39,6 +40,28 @@ app = Flask(__name__)
 
 MAILERLITE_GROUP_ID = "195545324381538237"  # Performance Timing Subscribers
 DOB_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# Stripe retries a webhook if it doesn't get a fast 200 — and it can also
+# deliver the same event more than once by design. Without this guard a
+# retry would send the subscriber a second identical report. In-memory
+# only: a restart clears it, which is acceptable because Stripe's retry
+# window is short and a restart mid-retry is rare. Capped so a long-lived
+# process can't grow this set indefinitely.
+_processed_events = set()
+_processed_lock = threading.Lock()
+
+
+def already_processed(event_id):
+    """True if this event id has been seen before. Records it if not."""
+    if not event_id:
+        return False
+    with _processed_lock:
+        if event_id in _processed_events:
+            return True
+        if len(_processed_events) > 5000:
+            _processed_events.clear()
+        _processed_events.add(event_id)
+        return False
 
 
 def fmt_long(iso_date):
@@ -213,6 +236,24 @@ def send_report_email(to_email, subscriber_name, pdf_path, ics_path, period_labe
         smtp.send_message(msg)
 
 
+def build_and_send(customer_email, customer_name, dob, start_date, event_type):
+    """The slow part — PDF render plus Gmail SMTP. Runs on a background
+    thread so the webhook can answer Stripe immediately. Stripe gives up
+    waiting after roughly 10 seconds and marks the delivery failed, then
+    retries; doing this work inline is what would cause duplicate sends."""
+    try:
+        result = generate_report(dob, start_date)
+        period_label = (f"{fmt_long(result['period']['start_date'])} to "
+                        f"{fmt_long(result['period']['end_date'])}")
+        send_report_email(
+            customer_email, customer_name, result["pdf_path"], result["ics_path"],
+            period_label, result["peak_decision_day"], len(result["standdown_days"]),
+        )
+    except Exception:
+        notify_failure("Report generation failed",
+                       f"{customer_email} ({event_type}):\n{traceback.format_exc()}")
+
+
 @app.route("/api/stripe-webhook", methods=["POST"])
 def stripe_webhook():
     payload = request.get_data()
@@ -228,10 +269,17 @@ def stripe_webhook():
 
     event = json.loads(payload)
     event_type = event.get("type")
+    event_id = event.get("id")
+
+    if already_processed(event_id):
+        return jsonify({"received": True, "ignored": "duplicate event"}), 200
 
     # checkout.session.completed = the FIRST payment (initial signup).
-    # invoice.paid = every RENEWAL payment thereafter (month 2, 3, 4...).
-    # Both must be handled, or reports stop after the first month.
+    # invoice.paid = fires on EVERY successful invoice, including the very
+    # first one — so handling both naively sends month one twice. Stripe
+    # distinguishes them with billing_reason: subscription_create is the
+    # signup invoice (already covered by checkout.session.completed), and
+    # subscription_cycle is a genuine renewal.
     if event_type == "checkout.session.completed":
         obj = event["data"]["object"]
         customer_email = obj.get("customer_details", {}).get("email") or obj.get("customer_email")
@@ -240,13 +288,17 @@ def stripe_webhook():
         paid_at_ts = obj.get("created")
     elif event_type == "invoice.paid":
         obj = event["data"]["object"]
+        billing_reason = obj.get("billing_reason")
+        if billing_reason != "subscription_cycle":
+            # subscription_create (first payment), subscription_update,
+            # manual, etc. — not a renewal, don't duplicate the report.
+            return jsonify({"received": True, "ignored": f"billing_reason={billing_reason}"}), 200
         customer_email = obj.get("customer_email")
         customer_name = obj.get("customer_name", "")
         paid = obj.get("status") == "paid"
-        # Use the invoice's period start (when this billing cycle began) so
-        # the report window starts the day after THIS charge, not today's
-        # server time — keeps cycles rolling correctly even if the webhook
-        # is processed slightly late.
+        # Use the moment this invoice was actually paid so the report window
+        # starts the day after THIS charge, not today's server time — keeps
+        # cycles rolling correctly even if the webhook is processed late.
         paid_at_ts = obj.get("status_transitions", {}).get("paid_at") or obj.get("created")
     else:
         return jsonify({"received": True, "ignored": event_type}), 200
@@ -271,20 +323,14 @@ def stripe_webhook():
     paid_at = datetime.utcfromtimestamp(paid_at_ts)
     start_date = (paid_at + timedelta(days=1)).date()
 
-    try:
-        result = generate_report(dob, start_date)
-        period_label = (f"{fmt_long(result['period']['start_date'])} to "
-                        f"{fmt_long(result['period']['end_date'])}")
-        send_report_email(
-            customer_email, customer_name, result["pdf_path"], result["ics_path"],
-            period_label, result["peak_decision_day"], len(result["standdown_days"]),
-        )
-    except Exception:
-        notify_failure("Report generation failed",
-                       f"{customer_email} ({event_type}):\n{traceback.format_exc()}")
-        return jsonify({"received": True, "error": "generation failed"}), 200
+    # Hand off and answer Stripe straight away.
+    threading.Thread(
+        target=build_and_send,
+        args=(customer_email, customer_name, dob, start_date, event_type),
+        daemon=True,
+    ).start()
 
-    return jsonify({"received": True, "sent": True}), 200
+    return jsonify({"received": True, "queued": True}), 200
 
 
 def generate_report(dob_str, start_date):
